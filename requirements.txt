@@ -1,0 +1,43 @@
+# Gold Trading AI — dependencies
+#
+# Rebuild on a NEW machine (never copy .venv — it hardcodes absolute
+# interpreter paths and the copy fails with launcher exit code 103):
+#
+#   py -3.11 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install --upgrade pip
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Versions are pinned to the set this system was calibrated and tested on.
+# pandas 3.x and numpy 2.x changed enough behaviour that an unpinned install
+# is not the same engine.
+
+# === Core numerics ===
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1
+
+# === Live broker (Windows only — no Linux wheel exists) ===
+metatrader5==5.0.5735
+
+# === Charts and reports ===
+matplotlib==3.11.0
+openpyxl==3.1.5
+
+# === Console output ===
+tqdm==4.68.3
+rich==15.0.0
+colorama==0.4.6
+
+# === Historical data helpers ===
+# duka_download.py shells out to `npx dukascopy-node`, so DOWNLOADING history
+# also needs Node.js on PATH. Not required to run live off MT5 data.
+requests==2.34.2
+curl_cffi==0.15.0
+beautifulsoup4==4.15.0
+yfinance==1.5.1
+
+# === Legacy ML paths (older research scripts) ===
+scikit-learn==1.9.0
+xgboost==3.2.0
+joblib==1.5.3
+ta==0.11.0

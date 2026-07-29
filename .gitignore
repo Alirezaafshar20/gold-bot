@@ -1,0 +1,60 @@
+# ── Environments & caches ────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ── Local machine state — never deploy another bot's journal ─────────────
+logs/
+*.log
+data/pending_zones*.json
+data/portfolio_slices.json
+data/cache/
+
+# Historical CSV dumps and Dukascopy months — copy once by robocopy/scp,
+# not through git (hundreds of MB, regenerable).
+data/
+.dukascopy-cache/
+raw/
+
+# ── Runtime artefacts ────────────────────────────────────────────────────
+# Keep the OOS gate JSONs the live bot reads; drop everything else.
+reports/**
+!reports/
+!reports/oos_test.json
+!reports/oos_test_M5.json
+!reports/oos_test.txt
+!reports/oos_test_M5.txt
+
+models/
+*.jsonl
+
+# ── Editor / OS noise ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Archives / installs — never push these (GitHub hard limit 100 MB) ───
+*.rar
+*.zip
+*.7z
+*.exe
+*.msi
+V5.3.rar
+
+# ── Secrets if you ever add them ─────────────────────────────────────────
+.env
+.env.*
+*.pem
+credentials*.json
+*token*
+github token.txt
+*password*
