@@ -10,6 +10,8 @@ Usage:
   python live_replay.py --days 7 --tf M5 --fill live
   python live_replay.py --days 7 --tf M5 --fill market
   python live_replay.py --days 3 --dual
+  python live_replay.py --dual --days 60 --balance 1000 --risk 0.02 --flat-risk
+  python live_replay.py --dual --days 60 --balance 1000 --flat 0.02
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8")
 print = functools.partial(print, flush=True)
 
+import numpy as np
 import pandas as pd
 
 import MetaTrader5 as mt5
@@ -35,7 +38,9 @@ import live_flight_recorder as FR
 from live_smc import TF_MIN
 
 
-WARMUP_BARS = 400
+# Don't start trading until a full live-sized signal window exists behind the
+# cursor, otherwise the first replayed bars run on a shorter history than live.
+WARMUP_BARS = LP.SIG_BARS
 
 _TF_ALIASES = {
     "M5": "M5", "5M": "M5", "5": "M5",
@@ -68,10 +73,21 @@ def normalize_fill(raw: str) -> str:
     return mode
 
 
-def _df_asof(full: pd.DataFrame, end_i: int) -> pd.DataFrame:
-    """Bars 0..end_i inclusive as 'closed', plus a synthetic forming bar
-    so live code's iloc[-2] is the just-closed candle (same as MT5 feed)."""
-    closed = full.iloc[: end_i + 1]
+def _df_asof(full: pd.DataFrame, end_i: int,
+             count: int | None = None) -> pd.DataFrame:
+    """Bars up to end_i as 'closed', plus a synthetic forming bar so live
+    code's iloc[-2] is the just-closed candle (same as MT5 feed).
+
+    `count` is the caller's requested window size and must be honoured: MT5
+    returns exactly `count` rows with the last one still forming, so replay
+    has to serve count-1 closed bars. Handing over an expanding window instead
+    feeds full-array indicators (volume profile, prior-day levels, swing
+    pivots, regime map) a different history than live ever sees.
+    """
+    lo = 0
+    if count and int(count) > 1:
+        lo = max(0, end_i + 2 - int(count))
+    closed = full.iloc[lo: end_i + 1]
     last = closed.iloc[-1]
     forming = closed.iloc[[-1]].copy()
     step = (closed.index[-1] - closed.index[-2]) if len(closed) > 1 else pd.Timedelta(minutes=15)
@@ -104,7 +120,9 @@ class LiveReplay:
 
     def __init__(self, asset: str, tf: str, days: int, balance: float,
                  fill_mode: str = "live", mirror_vps: bool = False,
-                 opt_overrides: dict | None = None, record: bool = False):
+                 opt_overrides: dict | None = None, record: bool = False,
+                 risk_pct: float | None = None, flat_risk: bool = False,
+                 fixed_lot: float | None = None, no_cap: bool = False):
         self.asset = asset
         self.tf = tf
         self.tf_min = TF_MIN[tf]
@@ -114,6 +132,15 @@ class LiveReplay:
         self.fillspread = 0.0
         self.mirror_vps = bool(mirror_vps)
         self.record = bool(record)
+        # risk_pct=None → profile / RISK_MAP default. flat_risk sizes every
+        # trade from start_balance so the equity curve is not compounded.
+        # fixed_lot ( --flat LOT ) wins over both: every fill uses that volume.
+        self.risk_pct_override = (float(risk_pct) if risk_pct is not None
+                                  else None)
+        self.flat_risk = bool(flat_risk)
+        self.fixed_lot = (float(fixed_lot) if fixed_lot is not None else None)
+        self.no_cap = bool(no_cap)
+        self._orig_calc_lot = None
         if self.mirror_vps:
             fill_mode = "market"
         self.fill_mode = normalize_fill(fill_mode)
@@ -126,6 +153,9 @@ class LiveReplay:
         self._next_ticket = 900000001
         self._next_pos_ticket = 800000001
         self._tick = None
+        self._now = None
+        self._sig_cache = None
+        self._sig_cache_key = None
         self._m1_lo = None
         self._m1_hi = None
         self._orig_symbol_info_tick = None
@@ -177,6 +207,8 @@ class LiveReplay:
         if self.opt_overrides:
             opt.update(self.opt_overrides)
         risk = C.RISK_MAP.get(self.asset, prof.get("risk_pct", S.RISK_PCT))
+        if self.risk_pct_override is not None:
+            risk = self.risk_pct_override
         magic = C.magic_for(self.asset, self.tf)
         self.st = LP.AssetRunner(
             self.asset, self.sym, prof, opt, magic, risk, tf_tag=self.tf)
@@ -186,17 +218,32 @@ class LiveReplay:
             self.st.max_pos = int(opt.get("max_concurrent") or 8)
             opt["regime_gate"] = False
 
+        # Preload the test window plus a full live-sized signal window, and let
+        # M1 reach just as far back so fetch_pair's overlap clip cannot eat it.
+        pad = LP.SIG_BARS + 60
+        span_bars = int(self.days * 1440 / self.tf_min) + 1
         _, self.sig, self.m1, self.cutoff = M.fetch_pair(
-            self.sym, self.tf, mt5=mt5, days=self.days)
+            self.sym, self.tf, mt5=mt5, days=self.days,
+            signal_count=min(99999, span_bars + pad),
+            m1_count=min(99999, int(self.days * 1440) + pad * self.tf_min))
         htf_tfs = list(opt.get("htf_tfs", ("H4", "H1")))
         if opt.get("regime_gate"):
             rtf = opt.get("regime_tf", "H1")
             if rtf not in htf_tfs:
                 htf_tfs.append(rtf)
+        # +LP.HTF_BARS so even the first replayed bar can serve the same 400
+        # HTF candles live gets; otherwise the regime map runs on a short series.
         _, htf_dfs = M.fetch_htf_bars(
-            self.sym, days=self.days, mt5=mt5, tfs=tuple(htf_tfs))
+            self.sym, days=self.days, mt5=mt5, tfs=tuple(htf_tfs),
+            warmup=LP.HTF_BARS + 60)
         self.htf_dfs = htf_dfs
+        # MT5 position 0 is the candle still being built. Live only ever acts
+        # on index[-2], so replay must not treat that unfinished bar as closed
+        # — its high/low keep moving and two runs minutes apart disagree.
+        if len(self.sig) > 1:
+            self.sig = self.sig.iloc[:-1]
         self.ctx = S.M1Ctx(self.m1, self.sig.index)
+        self._cache_arrays()
 
         n = int(LP.CALIB_DAYS * 1440 / M.tf_minutes(self.tf)) + 60
         try:
@@ -210,6 +257,12 @@ class LiveReplay:
             self.st.meta_gate = FC.load_meta_gate(assets=[self.asset])
         if self.mirror_vps:
             self.st.meta_gate = None
+
+        FR.log_session(
+            asset=self.st.key, tf=self.tf, mode="replay",
+            fp=LP.engine_fingerprint(self.st), dry=True,
+            sig_bars=LP.SIG_BARS, htf_bars=LP.HTF_BARS,
+            risk=float(self.st.risk_pct), rules=",".join(self.st.rule_names))
 
         self._install_hooks()
 
@@ -234,6 +287,10 @@ class LiveReplay:
         LP.cancel_order = self._cancel_order
         LP.close_position = self._close_position
         LP.modify_sl = self._modify_sl
+        # LP.arm_touch_limit / _execute_zone_fill call X.calc_lot — patch it
+        # so --flat LOT reaches every fill path without forking the live engine.
+        self._orig_calc_lot = X.calc_lot
+        X.calc_lot = self._calc_lot
         LP.ALLOW_DRY_LIMIT_FILL = True
         LP.set_broker_sim_step(self._broker_sim_step)
         self._orig_symbol_info_tick = mt5.symbol_info_tick
@@ -248,10 +305,33 @@ class LiveReplay:
         if self._orig_lp:
             for name, fn in self._orig_lp.items():
                 setattr(LP, name, fn)
+        if self._orig_calc_lot is not None:
+            X.calc_lot = self._orig_calc_lot
+            self._orig_calc_lot = None
         LP.set_broker_sim_step(None)
         LP.ALLOW_DRY_LIMIT_FILL = False
         LP.set_clock(None)
         self._patched = False
+
+    def _clamp_lot(self, symbol: str, lot: float) -> float:
+        """Round a requested lot to the broker's step / min / max."""
+        try:
+            spec = X.get_spec(symbol, mt5)
+            if not spec:
+                return float(lot)
+            step = float(spec["vol_step"] or 0.01)
+            lo = float(spec["vol_min"] or 0.01)
+            hi = float(spec["vol_max"] or 100.0)
+            lot = max(lo, round(float(lot) / step) * step)
+            return min(lot, hi)
+        except Exception:
+            return float(lot)
+
+    def _calc_lot(self, symbol, balance, risk_fraction, sl_distance, mt5_mod=None):
+        if self.fixed_lot is not None:
+            return self._clamp_lot(symbol, self.fixed_lot)
+        fn = self._orig_calc_lot or X.calc_lot
+        return fn(symbol, balance, risk_fraction, sl_distance, mt5_mod)
 
     def _symbol_info_tick(self, symbol=None):
         if self._tick is not None:
@@ -403,17 +483,83 @@ class LiveReplay:
                 reason=reason, ticket=closed["ticket"], ts=exit_t)
         return True
 
+    def _cache_arrays(self):
+        """Plain numpy views of the bar data the hot loop reads every step.
+
+        Boolean masks and .iloc lookups against the full frames cost more than
+        the engine step itself once you are polling once per M1 candle.
+        """
+        self._m1_idx = self.m1.index
+        self._m1_open = self.m1["open"].to_numpy(dtype=float)
+        self._m1_high = self.m1["high"].to_numpy(dtype=float)
+        self._m1_low = self.m1["low"].to_numpy(dtype=float)
+        self._m1_close = self.m1["close"].to_numpy(dtype=float)
+        self._m1_vol = (self.m1["volume"].to_numpy(dtype=float)
+                        if "volume" in self.m1.columns
+                        else np.zeros(len(self.m1)))
+        self._sig_high = self.sig["high"].to_numpy(dtype=float)
+        self._sig_low = self.sig["low"].to_numpy(dtype=float)
+        self._sig_close = self.sig["close"].to_numpy(dtype=float)
+
+    def _partial_htf_bar(self, open_ts, now, template):
+        """The HTF candle as far as it has printed at `now`.
+
+        MT5 hands live the bar that is still being built, so replay must not
+        hand the engine the same candle already finished — that is future data.
+        """
+        a = int(self._m1_idx.searchsorted(open_ts, side="left"))
+        b = int(self._m1_idx.searchsorted(pd.Timestamp(now), side="left"))
+        bar = template.iloc[[0]].copy()
+        bar.index = [open_ts]
+        if b <= a:
+            px = float(self._sig_close[self._asof_i])
+            vals = {"open": px, "high": px, "low": px, "close": px, "volume": 0.0}
+        else:
+            vals = {
+                "open": float(self._m1_open[a]),
+                "high": float(self._m1_high[a:b].max()),
+                "low": float(self._m1_low[a:b].min()),
+                "close": float(self._m1_close[b - 1]),
+                "volume": float(self._m1_vol[a:b].sum()),
+            }
+        for col, v in vals.items():
+            if col in bar.columns:
+                bar.iloc[0, bar.columns.get_loc(col)] = v
+        return bar
+
     def _get_bars(self, sym, tf, count=600):
+        # The engine polls once per M1 tick but the bar window only moves on a
+        # TF close, so the same frame gets rebuilt ~15x per candle. Nothing in
+        # live_portfolio writes to the frame, so handing back the cached object
+        # is the same data, not a copy of it.
         if tf == self.tf:
-            return _df_asof(self.sig, self._asof_i)
+            key = (self._asof_i, int(count or 0))
+            if self._sig_cache_key != key:
+                self._sig_cache = _df_asof(self.sig, self._asof_i, count)
+                self._sig_cache_key = key
+            return self._sig_cache
         hdf = self.htf_dfs.get(tf)
         if hdf is None:
             return None
-        t_end = self.sig.index[self._asof_i]
-        cut = hdf[hdf.index <= t_end]
+        # Cut at the decision instant, not the signal bar's OPEN stamp: live is
+        # polling after the candle closed and already sees the HTF bar that
+        # opened at that moment. Cutting at the open time left replay a whole
+        # H4/H1 candle behind live on every boundary.
+        now = pd.Timestamp(self._now) if self._now is not None else (
+            self.sig.index[self._asof_i] + pd.Timedelta(minutes=self.tf_min))
+        cut = hdf[hdf.index <= now]
         if len(cut) < 30:
             return None
+        step = pd.Timedelta(minutes=M.tf_minutes(tf))
+        if cut.index[-1] + step > now:
+            open_ts = cut.index[-1]
+            cut = pd.concat([cut.iloc[:-1],
+                             self._partial_htf_bar(open_ts, now, hdf)])
         return cut.iloc[-min(len(cut), count):]
+
+    def _size_balance(self) -> float:
+        """Balance used for lot sizing (and intended risk_usd fallback)."""
+        return self.start_balance if self.flat_risk else self.balance
 
     def _risk_usd(self, lot: float, sl_distance: float) -> float:
         """Money actually at risk for `lot`, not the intended risk_pct.
@@ -422,7 +568,7 @@ class LiveReplay:
         account routinely risks more (or less) than risk_pct. Pricing the trade
         off the intended risk hides that gap from the replay P&L.
         """
-        fallback = self.st.risk_pct * self.balance
+        fallback = self.st.risk_pct * self._size_balance()
         try:
             spec = X.get_spec(self.sym, mt5)
             lpl = X.loss_per_lot_usd(spec, sl_distance, mt5=mt5, symbol=self.sym)
@@ -458,7 +604,8 @@ class LiveReplay:
             if order:
                 lot = float(order.get("lot") or 0.0)
         if lot <= 0:
-            lot = X.calc_lot(self.sym, self.balance, self.st.risk_pct,
+            # Goes through the hooked X.calc_lot so --flat LOT applies here too.
+            lot = X.calc_lot(self.sym, self._size_balance(), self.st.risk_pct,
                              risk_act, mt5)
         pos_ticket = self._next_pos_ticket
         self._next_pos_ticket += 1
@@ -707,14 +854,20 @@ class LiveReplay:
         if hasattr(now, "to_pydatetime"):
             now = now.to_pydatetime()
         captured = now
+        self._now = now
         prev_clock = LP._CLOCK
         LP.set_clock(lambda: captured)
         try:
             last_bar_before = self.st.last_bar
+            # Same gate as the live loop: without it replay keeps filling zones
+            # that live refuses once the account is already loaded up.
+            bal = self._size_balance()
+            port_risk = LP.portfolio_open_risk_pct([self.st], bal)
+            risk_ok = self.no_cap or port_risk < C.MAX_PORTFOLIO_RISK - 0.001
             self._prev_pos_tickets, _ = LP.process_once(
                 [self.st],
-                bal=self.balance,
-                risk_ok=True,
+                bal=bal,
+                risk_ok=risk_ok,
                 dry=True,
                 tf=self.tf,
                 tf_min=self.tf_min,
@@ -765,9 +918,19 @@ class LiveReplay:
         n = len(self.sig)
         use_lim = bool(self.st.opt.get("touch_use_limit", True))
         mode_tag = "mirror-vps" if self.mirror_vps else f"fill={self.fill_mode}"
+        if self.fixed_lot is not None:
+            size_mode = f"FIXED LOT {self.fixed_lot:g}"
+        elif self.flat_risk:
+            size_mode = "flat from start_balance"
+        else:
+            size_mode = "compound on running balance"
         print(f"\n  LIVE REPLAY  |  {self.asset}  {self.tf}  |  {mode_tag}")
         print(f"  bars {start_i}→{n - 1}  start_bal=${self.start_balance:,.0f}  "
               f"entry={self.st.opt.get('entry_confirm_mode')}")
+        if self.fixed_lot is not None:
+            print(f"  sizing={size_mode}  (risk% ignored for volume)")
+        else:
+            print(f"  risk={self.st.risk_pct * 100:.2f}%  sizing={size_mode}")
         print(f"  min_fill_rr={self.st.opt.get('min_fill_rr')}  "
               f"max_pos={self.st.max_pos}  max_same_dir={self.st.opt.get('max_same_dir')}  "
               f"touch_limit={use_lim}  spread={self.spread}")
@@ -780,30 +943,30 @@ class LiveReplay:
             step = pd.Timedelta(minutes=self.tf_min)
             for i in range(start_i, n):
                 self._asof_i = i
-                mid = float(self.sig["close"].iloc[i])
+                mid = float(self._sig_close[i])
                 # MT5 stamps a bar with its OPEN time: bar i is only closed at
                 # t_i + tf. Live arms zones at that instant with price sitting
                 # at the close — never with the bar's own high/low.
                 closed = self.sig.index[i] + step
                 self._engine_step(closed, m1_lo=None, m1_hi=None, mid=mid)
                 self._update_equity_bar(
-                    closed, float(self.sig["low"].iloc[i]),
-                    float(self.sig["high"].iloc[i]), mid)
+                    closed, float(self._sig_low[i]), float(self._sig_high[i]),
+                    mid)
 
                 # M1 polls between this bar's close and the next bar's close
-                # (same role as the 10s live polls).
+                # (same role as the 10s live polls). searchsorted gives the
+                # same rows as an index mask without rescanning the frame.
                 t0 = closed
                 t1 = (self.sig.index[i + 1] + step) if i + 1 < n else None
-                if t1 is None:
-                    mask = self.m1.index >= t0
-                else:
-                    mask = (self.m1.index >= t0) & (self.m1.index < t1)
-                for ts, row in self.m1.loc[mask].iterrows():
+                a = int(self._m1_idx.searchsorted(t0, side="left"))
+                b = (len(self._m1_idx) if t1 is None
+                     else int(self._m1_idx.searchsorted(t1, side="left")))
+                for k in range(a, b):
                     self._engine_step(
-                        ts,
-                        m1_lo=float(row["low"]),
-                        m1_hi=float(row["high"]),
-                        mid=float(row["close"]),
+                        self._m1_idx[k],
+                        m1_lo=float(self._m1_low[k]),
+                        m1_hi=float(self._m1_high[k]),
+                        mid=float(self._m1_close[k]),
                     )
 
             self._force_close_remaining()
@@ -827,7 +990,9 @@ class LiveReplay:
 
 
 def run_dual(asset: str, days: int, balance: float, mirror_vps: bool = False,
-             fill_mode: str = "live", record: bool = False
+             fill_mode: str = "live", record: bool = False,
+             risk_pct: float | None = None, flat_risk: bool = False,
+             fixed_lot: float | None = None, no_cap: bool = False
              ) -> tuple[list[dict], list[LiveReplay], list[dict]]:
     """Run M5 then M15 (shared start balance per bot, like two VPS processes)."""
     engines: list[LiveReplay] = []
@@ -836,7 +1001,9 @@ def run_dual(asset: str, days: int, balance: float, mirror_vps: bool = False,
     for i, tf in enumerate(("M5", "M15")):
         eng = LiveReplay(
             asset, tf, days, balance, fill_mode=fill_mode,
-            mirror_vps=mirror_vps, record=record)
+            mirror_vps=mirror_vps, record=record,
+            risk_pct=risk_pct, flat_risk=flat_risk, fixed_lot=fixed_lot,
+            no_cap=no_cap)
         trades = eng.run(shutdown_mt5=(i == 1))
         engines.append(eng)
         all_trades.extend(trades)
@@ -908,6 +1075,18 @@ def main():
     ap.add_argument("--asset", default="XAUUSD")
     ap.add_argument("--balance", type=float, default=1000.0)
     ap.add_argument(
+        "--risk", type=float, default=None, metavar="FRAC",
+        help="Risk fraction per trade (e.g. 0.02 = 2%%). "
+             "Default: profile / RISK_MAP (gold is usually 1%%)")
+    ap.add_argument(
+        "--flat-risk", action="store_true",
+        help="Size every trade from --balance (no compounding). "
+             "PnL still accumulates; only the lot formula stays fixed")
+    ap.add_argument(
+        "--flat", type=float, default=None, metavar="LOT",
+        help="Fixed lot size every trade (e.g. --flat 0.02). "
+             "Ignores --risk / --flat-risk for volume")
+    ap.add_argument(
         "--fill", default="live",
         help="live=LIMIT@proximal broker-sim (default, shared LP path); "
              "market=chase touch price; proximal is an alias for live")
@@ -918,8 +1097,15 @@ def main():
         "--dual", action="store_true",
         help="Run M5 + M15 (like two bots on one account) and merge trades")
     ap.add_argument(
+        "--no-cap", action="store_true",
+        help="Disable the portfolio open-risk cap (live enforces it by default)")
+    ap.add_argument(
         "--record", action="store_true",
-        help="Write flight_recorder JSONL (for exact_replay diagnostics)")
+        help="Write flight_recorder JSONL — decision journal for parity_diff")
+    ap.add_argument(
+        "--journal-path", default=None, metavar="FILE",
+        help="Send the flight recorder to FILE instead of reports/"
+             "flight_recorder_<TF>.jsonl (keeps the live tape untouched)")
     ap.add_argument("--compare", action="store_true",
                     help="Also run portfolio_backtest on the same window")
     args = ap.parse_args()
@@ -927,14 +1113,30 @@ def main():
         args.fill = "market"
     else:
         args.fill = normalize_fill(args.fill)
+    if args.risk is not None and args.risk <= 0:
+        ap.error("--risk must be a positive fraction (e.g. 0.02)")
+    if args.flat is not None and args.flat <= 0:
+        ap.error("--flat LOT must be > 0 (e.g. 0.02)")
+    if args.flat is not None and (args.risk is not None or args.flat_risk):
+        print("  NOTE: --flat LOT wins; --risk / --flat-risk ignored for volume")
+    if args.journal_path:
+        FR.set_path(args.journal_path)
+        args.record = True
 
     if args.dual:
         trades, engines, _ideas = run_dual(
             args.asset, args.days, args.balance,
             mirror_vps=args.mirror_vps, fill_mode=args.fill,
-            record=args.record)
+            record=args.record, risk_pct=args.risk,
+            flat_risk=args.flat_risk, fixed_lot=args.flat,
+            no_cap=args.no_cap)
         tag = "mirror-vps" if args.mirror_vps else f"fill={args.fill}"
-        _print_trades(trades, f"LIVE-REPLAY DUAL M5+M15 {tag}")
+        if args.flat is not None:
+            risk_tag = f"FIXED LOT {args.flat:g}"
+        else:
+            risk_tag = (f"risk={engines[0].st.risk_pct * 100:.2f}%"
+                        + (" flat" if args.flat_risk else " compound"))
+        _print_trades(trades, f"LIVE-REPLAY DUAL M5+M15 {tag} {risk_tag}")
         bal = args.balance + sum(t["net"] for t in trades)
         print(f"\n  DUAL merged: {len(trades)} trades  "
               f"PnL=${bal - args.balance:+.2f}  end≈${bal:,.2f}  "
@@ -947,7 +1149,9 @@ def main():
         args.tf = normalize_tf(args.tf)
         eng = LiveReplay(
             args.asset, args.tf, args.days, args.balance, args.fill,
-            mirror_vps=args.mirror_vps, record=args.record)
+            mirror_vps=args.mirror_vps, record=args.record,
+            risk_pct=args.risk, flat_risk=args.flat_risk,
+            fixed_lot=args.flat, no_cap=args.no_cap)
         trades = eng.run()
         tag = "mirror-vps" if args.mirror_vps else f"fill={args.fill}"
         _print_trades(trades, f"LIVE-REPLAY {args.tf} {tag}")
@@ -959,6 +1163,12 @@ def main():
         print("  • --mirror-vps is a legacy profile, not live≡replay identity.")
     else:
         print("  • Identity mode: LP.process_once + same ENTRY config as live.")
+    if args.flat is not None:
+        print(f"  • --flat {args.flat:g}: every trade uses that lot "
+              f"(rounded to broker vol_step).")
+    elif args.flat_risk:
+        print("  • --flat-risk: lot sized from start balance every trade "
+              "(not live default — live compounds).")
 
 
 if __name__ == "__main__":

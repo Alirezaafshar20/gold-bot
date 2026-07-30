@@ -192,8 +192,14 @@ def fetch_pair(symbol, signal_tf, m1_count=None, signal_count=None, mt5=None,
 
 
 def fetch_htf_bars(symbol, days=None, signal_count=None, mt5=None,
-                   tfs=("H4", "H1")):
-    """Download higher-TF bars aligned with backtest period (for HTF take-profit)."""
+                   tfs=("H4", "H1"), warmup=120):
+    """Download higher-TF bars aligned with backtest period (for HTF take-profit).
+
+    `warmup` must cover whatever HTF window the consumer asks for at runtime.
+    A replay that only preloads days+120 H4 bars hands the regime map a much
+    shorter series than live's 400, and a confirm/cooldown state machine reads
+    a different label off it.
+    """
     mt5 = mt5 or connect()
     sym = resolve_symbol(symbol, mt5)
     out = {}
@@ -201,7 +207,7 @@ def fetch_htf_bars(symbol, days=None, signal_count=None, mt5=None,
         tf = tf.upper()
         tf_min = tf_minutes(tf)
         if days is not None:
-            count = _bars_for_period(tf_min, days, warmup=120)
+            count = _bars_for_period(tf_min, days, warmup=warmup)
         else:
             count = signal_count or 100000
         out[tf] = fetch_bars(sym, tf, count=count, mt5=mt5)

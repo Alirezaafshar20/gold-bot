@@ -89,10 +89,15 @@ WEEKLY = {
     # Live/backtest parity (2026-07-16):
     #   causal_week_cutoff    gate ignores trades closed inside the current ISO
     #                         week — identical basis to the walk-forward replay
-    #   live_refresh_on_trades False = refresh only on week change / 24h
-    #                         schedule (backtest never refreshes mid-week)
+    #   live_refresh_on_trades False = refresh only on ISO week change
+    #                         (backtest never refreshes mid-week)
+    #   live_refresh_hours    extra mid-week refresh cadence. 0 = off. Anything
+    #                         else makes the gate depend on the wall-clock hour
+    #                         the bot happened to be started, so two machines
+    #                         (and a replay) can hold different gates mid-week.
     "causal_week_cutoff": True,
     "live_refresh_on_trades": False,
+    "live_refresh_hours": 0,
 }
 
 # ── Phase 3b: full OOS recalibration schedule ────────────────────────────
@@ -337,7 +342,13 @@ def print_status():
     print(f"  Clock         : bars in UTC; sessions on {CLOCK['session_tz']};"
           f" day rolls at {CLOCK['day_anchor_hour']:02d}:00 UTC")
     print(f"  Live journal  : {WEEKLY.get('trades_csv', 'reports/portfolio_trades.csv')}")
-    print(f"  Weekly refresh: ISO week change | every 24h | after closed trades")
+    _wr = ["ISO week change"]
+    _wh = float(WEEKLY.get("live_refresh_hours", 0) or 0)
+    if _wh > 0:
+        _wr.append(f"every {_wh:g}h")
+    if WEEKLY.get("live_refresh_on_trades"):
+        _wr.append("after closed trades")
+    print(f"  Weekly refresh: {' | '.join(_wr)}")
     mg = load_meta_gate()
     if mg:
         print("\n  Meta-gate table (active assets):")

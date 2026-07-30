@@ -13,6 +13,7 @@ Usage:
 import argparse
 import datetime as dt
 import functools
+import hashlib
 import json
 import os
 import sys
@@ -50,6 +51,12 @@ LOOP_SEC = 10
 FILLED_ZONE_KEEP_H = 24  # filled zones stay on the chart this long
 ZONE_STATE_FILE = "data/pending_zones.json"  # per-TF via set_zone_state_file()
 
+# Bar windows handed to the engine. Replay must serve exactly these sizes or
+# every full-array indicator (VP, prior-day levels, pivots, regime map) is
+# computed over a different history than live and the two forks apart.
+SIG_BARS = 600   # signal TF (M5/M15) per poll — last row is the forming bar
+HTF_BARS = 400   # H1/H4 context per zone registration
+
 # Injectable clock — live uses wall time; replay sets historical bar/M1 time.
 _CLOCK = None  # None → datetime.now(); else zero-arg callable → datetime
 
@@ -67,6 +74,11 @@ def clock_now() -> dt.datetime:
     if _CLOCK is not None:
         return _CLOCK()
     return dt.datetime.now()
+
+
+# Undated flight-recorder events follow the same clock as the engine, so a
+# replayed fill is stamped with the bar it happened on, not with real time.
+FR.set_clock(clock_now)
 
 
 def set_clock(fn=None) -> None:
@@ -163,6 +175,42 @@ def direction_slot_free(st, direction: str) -> bool:
     return (_dir_open_count(st, direction) + _dir_armed_count(st, direction)) < cap
 
 
+# Broker/session conditions, not trading rules: these are re-measured on every
+# start (live spread, ATR-calibrated min stop) and would otherwise make the
+# fingerprint drift with the market instead of with the config.
+_FP_SKIP = ("spread_usd", "min_risk_usd", "min_sl")
+
+
+def _fp_value(v):
+    """Config values only — drop live objects whose repr changes every run."""
+    if v is None or isinstance(v, (int, float, str, bool)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_fp_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _fp_value(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+    return None
+
+
+def engine_fingerprint(st) -> str:
+    """Hash of the rules+settings a zone was born under.
+
+    Zones persisted by an older config are not comparable to what the current
+    engine would produce, so a restart after a config change must not resurrect
+    them — that is exactly how live drifts away from a clean replay.
+    """
+    opt = {k: v for k, v in st.opt.items() if k not in _FP_SKIP}
+    payload = {
+        "tf": st.tf_tag,
+        "rules": sorted(str(r) for r in st.rule_names),
+        "risk": round(float(st.risk_pct), 6),
+        "opt": _fp_value(opt),
+        "det": _fp_value(dict(getattr(st, "det_params", {}) or {})),
+    }
+    raw = json.dumps(payload, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
 def save_zone_state(states):
     """Persist pending zones so a restart (code update) doesn't drop them.
 
@@ -192,6 +240,7 @@ def save_zone_state(states):
                 r["died_at"] = z["died_at"].isoformat()
                 drows.append(r)
             doc[f"{st.key}::dead"] = drows
+            doc[f"{st.key}::fp"] = engine_fingerprint(st)
         tmp = f"{ZONE_STATE_FILE}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f)
@@ -211,6 +260,14 @@ def load_zone_state(states):
         return
     now = clock_now()
     for st in states:
+        saved_fp = doc.get(f"{st.key}::fp")
+        cur_fp = engine_fingerprint(st)
+        if saved_fp and saved_fp != cur_fp:
+            n_drop = len(doc.get(st.key) or [])
+            print(f"[ZONE] {st.key}: config changed since last run "
+                  f"({saved_fp} → {cur_fp}) — dropped {n_drop} stale zone(s)")
+            st.pending_zones = []
+            continue
         rows = doc.get(st.key) or []
         restored = []
         for r in rows:
@@ -290,7 +347,12 @@ def should_refresh_weekly(last_week_id: str | None, last_refresh: dt.datetime | 
         return True
     if last_refresh is None:
         return True
-    return (now - last_refresh) >= dt.timedelta(hours=24)
+    # Mid-week refreshes are off by default: their timing depends on when the
+    # process was started, so the same week can run on different gates.
+    hours = float(FC.WEEKLY.get("live_refresh_hours", 0) or 0)
+    if hours <= 0:
+        return False
+    return (now - last_refresh) >= dt.timedelta(hours=hours)
 
 
 def open_exposure_usd(st, account_bal):
@@ -564,14 +626,24 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
     i = B.n - 2
     opt["min_risk_usd"] = st.min_sl
 
+    def _bar_log(gate, **kw):
+        FR.log_bar(st, df=df, upto=i, ts=closed_time, gate=gate,
+                   close=float(B.c[i]), **kw)
+
+    def _rej(rule, direction, reason, **kw):
+        FR.log_cand(st, rule=rule, side=direction, reason=reason,
+                    ts=closed_time, **kw)
+
     if opt.get("require_atr_regime") and not opt.get("spike_mode") and not S.atr_regime_pass(
             B, i, lookback=opt.get("atr_lookback", S.OPT_STABLE_ATR_LB),
             max_ratio=opt.get("atr_max_ratio", S.OPT_STABLE_ATR_RATIO)):
+        _bar_log("atr_regime")
         return
 
     sess_start, sess_end = opt.get("session_start"), opt.get("session_end")
     if sess_start is not None and sess_end is not None:
         if not S.session_pass(closed_time, sess_start, sess_end):
+            _bar_log("session")
             return
 
     htf_dfs = {}
@@ -581,7 +653,7 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
         if rtf not in htf_needed:
             htf_needed.append(rtf)
     for htf in htf_needed:
-        hdf = get_bars(st.sym, htf, 400)
+        hdf = get_bars(st.sym, htf, HTF_BARS)
         if hdf is not None:
             htf_dfs[htf] = hdf
     htf_ctx = S.prepare_htf_context(htf_dfs)
@@ -603,16 +675,21 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
             shock_win=opt.get("regime_shock_win", 24),
             shock_baseline=opt.get("regime_shock_baseline", 720))
 
+    htf_fp = {tf_name: FR.frame_fingerprint(hdf)
+              for tf_name, hdf in htf_dfs.items()} if FR.journal_on() else {}
+
     cur_regime = None
     if rmap is not None:
         cur_regime = rmap.at(B.t[i])
         if (opt.get("meta_gate") and st.meta_gate
                 and opt.get("meta_skip_if_no_rules")
                 and not st.meta_gate.has_any(st.key, cur_regime)):
+            _bar_log("meta_no_rules", htf=htf_fp, regime=cur_regime)
             return
 
     existing = {_zone_fingerprint(z["tag"], z["proximal"], z["direction"], z["signal_bar"])
                 for z in st.pending_zones}
+    n_cand = n_armed = 0
     wait_min = S.WAIT_BARS * tf_min
     expires = clock_now() + dt.timedelta(minutes=wait_min)
     signal_key = str(closed_time)[:16]
@@ -629,15 +706,20 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
                 htf_tfs=tuple(opt.get("htf_tfs", ("H4", "H1"))),
                 nds_max_ratio=opt.get("nds_max_ratio", S.OPT_NDS_MAX_RATIO),
                 spike_params=st.spike_params):
+            n_cand += 1
             if not S.vp_pass(B, i, direction, proximal,
                              opt.get("vp_mode", S.VP_MODE),
                              window=opt.get("vp_window", 480),
                              vp_tol_atr=opt.get("vp_tol_atr", 0.0)):
+                _rej(tag, direction, "vp", proximal=float(proximal),
+                     distal=float(distal))
                 continue
             if opt.get("require_confluence") and not S.setup_confluence_pass(
                     B, i, direction, tag, st.rule_names):
+                _rej(tag, direction, "confluence", proximal=float(proximal))
                 continue
             if opt.get("require_bos") and not S.bos_confirm_pass(B, i, direction):
+                _rej(tag, direction, "bos", proximal=float(proximal))
                 continue
             atr_i = B.atr[i] if B.atr[i] > 0 else (B.rng[i] + 1e-6)
             etol = st.det_params.get("entry_tol_atr", 0.0) * atr_i
@@ -650,23 +732,31 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
             risk = (limit_px - sl) if direction == "long" else (sl - limit_px)
             _entry = limit_px
             if risk <= 0:
+                _rej(tag, direction, "risk<=0", proximal=float(proximal),
+                     distal=float(distal), sl=float(sl), limit=float(limit_px))
                 continue
             if not S.regime_allows(
                     rmap, B.t[i], direction, rule=name,
                     shock_gate=opt.get("regime_shock_gate", False),
                     shock_ratio=opt.get("regime_shock_ratio", 1.8),
                     flip_cooldown_h=opt.get("regime_flip_cooldown_h", 0.0)):
+                _rej(tag, direction, "regime", proximal=float(proximal),
+                     regime=cur_regime)
                 continue
             if st.meta_gate is not None:
                 reg = cur_regime if cur_regime is not None else (
                     rmap.at(B.t[i]) if rmap is not None else "RANGE")
                 if not st.meta_gate.allows(st.key, name, reg):
+                    _rej(tag, direction, "meta_gate",
+                         proximal=float(proximal), regime=reg)
                     continue
             reg = cur_regime if cur_regime is not None else (
                 rmap.at(B.t[i]) if rmap is not None else "RANGE")
             if not C.rule_allowed(st.key, name, reg,
                                   direction=direction,
                                   macro=rmap.macro_at(B.t[i]) if rmap and hasattr(rmap, "macro_at") else 0):
+                _rej(tag, direction, "rule_gate", proximal=float(proximal),
+                     regime=reg)
                 continue
             if not S.fib_filter_pass(
                     B, i, direction, _entry, name, proximal, distal,
@@ -677,6 +767,8 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
                     opt.get("fib_ob_only", False),
                     opt.get("fib_spike_exempt", False),
                     opt.get("fib_demand_exempt", False)):
+                _rej(tag, direction, "fib", proximal=float(proximal),
+                     entry=float(_entry))
                 continue
             if not S.entry_filters_pass(
                     B, i, risk, min_risk_usd=opt["min_risk_usd"],
@@ -686,6 +778,8 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
                     htf_trend=opt.get("htf_trend", False),
                     htf_ema=opt.get("htf_ema", 20),
                     htf_tfs=tuple(opt.get("htf_trend_tfs") or opt.get("htf_tfs", ("H1",)))):
+                _rej(tag, direction, "entry_filters", proximal=float(proximal),
+                     risk=float(risk), min_risk_usd=float(opt["min_risk_usd"]))
                 continue
             trade_tag = S.resolve_trade_tag(
                 name, tag, B, i, direction, proximal, distal,
@@ -702,6 +796,7 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
             zone_lo, zone_hi = entry_zone_bounds(direction, proximal, etol)
             fp = _zone_fingerprint(trade_tag, proximal, direction, signal_key)
             if fp in existing:
+                _rej(trade_tag, direction, "dup", proximal=float(proximal))
                 continue
             # One idea per direction: skip if already open or armed that way.
             if not direction_slot_free(st, direction):
@@ -732,13 +827,17 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
             }
             st.pending_zones.append(zone)
             existing.add(fp)
-            FR.log_armed(st, zone, closed_time)
+            n_armed += 1
+            FR.log_armed(st, zone, closed_time, regime=cur_regime)
             tp_s = f" TP {tp:.2f}" if tp else ""
             if tp and tp_src:
                 tp_s += f" [{tp_src}]"
             print(f"[ZONE] {closed_time} {st.key} {trade_tag} {direction.upper()} "
                   f"entry [{zone_lo:.5g} – {zone_hi:.5g}] limit {limit_px:.5g}  "
                   f"SL {sl:.5g}{tp_s}  wait={wait_min}m")
+
+    _bar_log("ok", htf=htf_fp, regime=cur_regime,
+             cands=n_cand, armed=n_armed, pending=len(st.pending_zones))
 
 
 def invalidate_zones(st, df, dry=False):
@@ -1004,7 +1103,7 @@ def process_once(states, *, bal, risk_ok, dry, tf, tf_min,
     n_closed = 0
     try:
         for st in states:
-            df = get_bars(st.sym, tf, 600)
+            df = get_bars(st.sym, tf, SIG_BARS)
             if df is None or len(df) < 60:
                 continue
 
@@ -1066,6 +1165,9 @@ def main():
     ap.add_argument("--risk-scale", type=float, default=1.0,
                     help="Multiply per-trade risk (e.g. 0.5 when running two "
                          "TF bots on one account)")
+    ap.add_argument("--no-journal", action="store_true",
+                    help="Stop writing the per-bar decision journal "
+                         "(bar/cand events used by parity_diff.py)")
     args = ap.parse_args()
     tf = args.tf
     tf_min = TF_MIN[tf]
@@ -1077,6 +1179,7 @@ def main():
     FC.apply_tf_paths(tf)
     set_zone_state_file(tf)
     FR.set_tf(tf)
+    FR.set_journal(not args.no_journal)
 
     if not mt5.initialize():
         print(f"[MT5] connect failed: {mt5.last_error()}")
@@ -1137,6 +1240,12 @@ def main():
         print(f"  {st.label:<12} {st.sym:<14} risk={st.risk_pct*100:.0f}%  "
               f"min_sl={st.min_sl:.5g}  magic={st.magic}  rules={len(st.rule_names)}")
     print(sep + "\n")
+
+    for st in states:
+        FR.log_session(asset=st.key, tf=st.tf_tag, mode="live",
+                       fp=engine_fingerprint(st), dry=bool(dry),
+                       sig_bars=SIG_BARS, htf_bars=HTF_BARS,
+                       risk=float(st.risk_pct), rules=",".join(st.rule_names))
 
     refresh_weekly_system(states, mt5, reason="startup")
     load_zone_state(states)

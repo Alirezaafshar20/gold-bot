@@ -5,12 +5,19 @@ This is the ground-truth tape for exact_replay + parity scoring.
 One line = one event. Paths are per-TF (M5/M15) via set_tf().
 
 Events:
-  armed | skip_register | limit_armed | limit_cancel | fill | skip_fill
-  invalidate | expire | touch | open_seen | close
+  session | bar | cand | armed | skip_register | limit_armed | limit_cancel
+  fill | skip_fill | invalidate | expire | touch | open_seen | close
+
+`bar` and `cand` are the decision journal: one `bar` per closed candle with a
+fingerprint of the exact window the engine saw, and one `cand` per rejected
+setup with the gate that killed it. Live and replay both emit them from the
+shared register_zones, so parity_diff can tell a data mismatch (different
+fingerprint) from a logic mismatch (same fingerprint, different verdict).
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import threading
@@ -20,6 +27,10 @@ _LOCK = threading.Lock()
 _TF = "M15"
 _PATH_OVERRIDE: str | None = None
 _ENABLED = True
+_JOURNAL = True
+# Set by live_portfolio to its injectable clock, so events logged without an
+# explicit ts land on replay's simulated time instead of real wall time.
+_CLOCK = None
 
 DEFAULT_DIR = "reports"
 
@@ -39,6 +50,22 @@ def set_enabled(on: bool) -> None:
     _ENABLED = bool(on)
 
 
+def set_journal(on: bool) -> None:
+    """Toggle the per-bar / per-candidate decision journal."""
+    global _JOURNAL
+    _JOURNAL = bool(on)
+
+
+def journal_on() -> bool:
+    return bool(_ENABLED and _JOURNAL)
+
+
+def set_clock(fn) -> None:
+    """Zero-arg callable returning 'now' for events logged without a ts."""
+    global _CLOCK
+    _CLOCK = fn
+
+
 def recorder_path(tf: str | None = None) -> str:
     if _PATH_OVERRIDE:
         return _PATH_OVERRIDE
@@ -50,6 +77,11 @@ def recorder_path(tf: str | None = None) -> str:
 
 def _iso(ts) -> str:
     if ts is None:
+        if _CLOCK is not None:
+            try:
+                return _CLOCK().isoformat(timespec="seconds")
+            except Exception:
+                pass
         return dt.datetime.now().isoformat(timespec="seconds")
     if isinstance(ts, dt.datetime):
         return ts.isoformat(timespec="seconds")
@@ -118,6 +150,66 @@ def log_event(event: str, *, asset: str = "", tf: str | None = None,
             print(f"[FLIGHT] log failed: {exc}")
         except Exception:
             pass
+
+
+def frame_fingerprint(df, upto=None) -> dict:
+    """Identify the exact bar window an engine decided on.
+
+    Returned as n/first/last/sha so a diff can separate "both engines saw the
+    same candles and disagreed" from "they were never looking at the same
+    data". `upto` excludes the forming bar, whose values are live-only noise.
+    """
+    try:
+        import numpy as np
+        sub = df if upto is None else df.iloc[: int(upto) + 1]
+        cols = [c for c in ("open", "high", "low", "close") if c in sub.columns]
+        arr = np.ascontiguousarray(
+            np.round(sub[cols].to_numpy(dtype="float64"), 5))
+        return {
+            "n": int(len(sub)),
+            "first": _iso(sub.index[0]),
+            "last": _iso(sub.index[-1]),
+            "sha": hashlib.sha1(arr.tobytes()).hexdigest()[:12],
+        }
+    except Exception:
+        return {}
+
+
+def log_session(*, asset: str, tf: str, mode: str, **extra) -> None:
+    """Startup marker: which config this tape was produced under."""
+    log_event("session", asset=asset, tf=tf, reason=mode, **extra)
+
+
+def log_bar(st, *, df, upto, ts, gate: str, htf: dict | None = None, **extra):
+    """One line per closed candle: the window, the regime, the verdict."""
+    if not journal_on():
+        return
+    fp = frame_fingerprint(df, upto)
+    fields = {
+        "gate": gate,
+        "n_bars": fp.get("n"),
+        "win_first": fp.get("first"),
+        "win_last": fp.get("last"),
+        "win_sha": fp.get("sha"),
+    }
+    for tf_name, hfp in (htf or {}).items():
+        key = str(tf_name).lower()
+        fields[f"{key}_n"] = hfp.get("n")
+        fields[f"{key}_last"] = hfp.get("last")
+        fields[f"{key}_sha"] = hfp.get("sha")
+    fields.update(extra)
+    log_event("bar", asset=st.key, tf=st.tf_tag, symbol=st.sym, ts=ts,
+              reason=gate, **fields)
+
+
+def log_cand(st, *, rule, side, reason, ts, **extra):
+    """A setup the detectors produced but a gate rejected."""
+    if not journal_on():
+        return
+    # No symbol= on purpose: this fires many times per bar and a tick snapshot
+    # would mean an MT5 round trip per rejected candidate.
+    log_event("cand", asset=st.key, tf=st.tf_tag,
+              rule=rule, side=side, reason=reason, ts=ts, **extra)
 
 
 def log_armed(st, z, closed_time, **extra):

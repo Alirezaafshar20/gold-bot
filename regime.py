@@ -93,16 +93,32 @@ def _to_ohlc_df(src):
 
 
 def _pivot_points(high, low, left=2, right=2):
-    """Return lists of (index, value) for swing highs and lows."""
+    """Return lists of (index, value) for swing highs and lows.
+
+    Vectorised over sliding windows: the per-bar Python loop this replaces was
+    the single hottest path in a replay, since the regime map rebuilds it for
+    every bar of every higher-timeframe candle.
+    """
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
     n = len(high)
-    ph, pl = [], []
-    for i in range(left, n - right):
-        hw = high[i - left:i + right + 1]
-        lw = low[i - left:i + right + 1]
-        if high[i] >= hw.max() and high[i] > high[max(0, i - 1)]:
-            ph.append((i, float(high[i])))
-        if low[i] <= lw.min() and low[i] < low[max(0, i - 1)]:
-            pl.append((i, float(low[i])))
+    w = left + right + 1
+    if n < w:
+        return [], []
+    idx = np.arange(left, n - right)
+    prev = np.maximum(idx - 1, 0)
+    m = len(idx)
+    # Fold the window with w slice-wise max/min passes. For the tiny windows
+    # this runs on (w=5), that beats building a strided view per call.
+    hmax = high[0:m].copy()
+    lmin = low[0:m].copy()
+    for k in range(1, w):
+        np.maximum(hmax, high[k:k + m], out=hmax)
+        np.minimum(lmin, low[k:k + m], out=lmin)
+    is_ph = (high[idx] >= hmax) & (high[idx] > high[prev])
+    is_pl = (low[idx] <= lmin) & (low[idx] < low[prev])
+    ph = [(int(i), float(high[i])) for i in idx[is_ph]]
+    pl = [(int(i), float(low[i])) for i in idx[is_pl]]
     return ph, pl
 
 
@@ -183,12 +199,20 @@ class MtfRegimeMap:
         h1_sl = reg_slope(h1_close, h1_win)
         macro = np.zeros(n, dtype=int)
         raw = np.array(["RANGE"] * n, dtype=object)
+        # Four H1 bars share one H4 bar, so the macro bias for a given H4 index
+        # is the same answer computed four times. The arrays are fixed for the
+        # whole loop, so memoising it is exact, not an approximation.
+        macro_by_h4: dict[int, int] = {}
         for i in range(n):
             j = int(np.searchsorted(h4_t, self.t[i], side="right")) - 1
             if j < 0:
                 continue
-            macro[i] = macro_structure_bias(
-                h4_high, h4_low, h4_close, j, lookback=h4_lookback)
+            bias = macro_by_h4.get(j)
+            if bias is None:
+                bias = macro_structure_bias(
+                    h4_high, h4_low, h4_close, j, lookback=h4_lookback)
+                macro_by_h4[j] = bias
+            macro[i] = bias
             if structure_break and i >= brk_win:
                 if h1_close[i] > h1_high[i - brk_win:i].max():
                     raw[i] = "TREND_UP"
