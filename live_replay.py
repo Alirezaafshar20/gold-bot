@@ -33,6 +33,7 @@ import symbol_specs as X
 import portfolio_config as C
 import floating_config as FC
 import mt5_data as M
+import dukascopy_loader as DK
 import live_portfolio as LP
 import live_flight_recorder as FR
 from live_smc import TF_MIN
@@ -122,11 +123,16 @@ class LiveReplay:
                  fill_mode: str = "live", mirror_vps: bool = False,
                  opt_overrides: dict | None = None, record: bool = False,
                  risk_pct: float | None = None, flat_risk: bool = False,
-                 fixed_lot: float | None = None, no_cap: bool = False):
+                 fixed_lot: float | None = None, no_cap: bool = False,
+                 end: str | None = None, spread: float | None = None):
         self.asset = asset
         self.tf = tf
         self.tf_min = TF_MIN[tf]
         self.days = days
+        # end=None replays the most recent `days`. A date replays the `days`
+        # ending there, which is the only way to test the rules against a
+        # different market direction than the one we happen to be in.
+        self.end_ts = pd.Timestamp(end) if end else None
         self.start_balance = balance
         self.balance = balance
         self.fillspread = 0.0
@@ -140,6 +146,7 @@ class LiveReplay:
         self.flat_risk = bool(flat_risk)
         self.fixed_lot = (float(fixed_lot) if fixed_lot is not None else None)
         self.no_cap = bool(no_cap)
+        self.spread_override = (float(spread) if spread is not None else None)
         self._orig_calc_lot = None
         if self.mirror_vps:
             fill_mode = "market"
@@ -174,6 +181,35 @@ class LiveReplay:
         self.max_open = 0
         self.max_open_risk_pct = 0.0
 
+    def _resolve_spread(self, mt5, prof):
+        """Spread to charge every historical fill.
+
+        P.live_spread returns max(profile_spread, ask - bid) from a single quote
+        taken as the script starts, which is the right answer for live and the
+        wrong one for a replay: that one quote gets applied to every fill across
+        the whole window. Outside trading hours it is badly wrong — WM Markets
+        quotes gold at 0.68 with the market shut against a measured median of
+        0.26 while it is open, so a replay run on a weekend charges every trade
+        more than 2.5x the real cost and suppresses limit fills that would have
+        happened.
+
+        So: honour an explicit --spread, otherwise take the live quote only when
+        it is not wider than the profile's own figure, and say which was used.
+        """
+        if self.spread_override is not None:
+            print(f"  spread: {self.spread_override:.3f} USD (--spread)")
+            return float(self.spread_override)
+        live = P.live_spread(self.sym, prof, mt5)
+        book = float(prof["spread"])
+        if live > book * 1.25:
+            print(f"  spread: {book:.3f} USD from the symbol profile — the live "
+                  f"quote reads {live:.3f}, which is a closed or thin market and "
+                  f"not what these fills would have paid. Override with --spread.")
+            return book
+        print(f"  spread: {live:.3f} USD (live quote, in line with the "
+              f"{book:.3f} profile figure)")
+        return live
+
     def load(self):
         if not mt5.initialize():
             raise RuntimeError(f"MT5 connect failed: {mt5.last_error()}")
@@ -185,7 +221,7 @@ class LiveReplay:
         _, prof = P.get_profile(self.asset)
         self.prof = prof
         self.sym = P.resolve_symbol_for_profile(self.asset, mt5)
-        self.spread = P.live_spread(self.sym, prof, mt5)
+        self.spread = self._resolve_spread(mt5, prof)
         self.fillspread = self.spread
         opt = P.resolve_live_opt(prof)
         opt = P.apply_profile_to_settings(opt, prof, self.spread)
@@ -222,10 +258,23 @@ class LiveReplay:
         # M1 reach just as far back so fetch_pair's overlap clip cannot eat it.
         pad = LP.SIG_BARS + 60
         span_bars = int(self.days * 1440 / self.tf_min) + 1
-        _, self.sig, self.m1, self.cutoff = M.fetch_pair(
-            self.sym, self.tf, mt5=mt5, days=self.days,
-            signal_count=min(99999, span_bars + pad),
-            m1_count=min(99999, int(self.days * 1440) + pad * self.tf_min))
+        sig_n = min(99999, span_bars + pad)
+        m1_n = min(99999, int(self.days * 1440) + pad * self.tf_min)
+        if self.end_ts is None:
+            _, self.sig, self.m1, self.cutoff = M.fetch_pair(
+                self.sym, self.tf, mt5=mt5, days=self.days,
+                signal_count=sig_n, m1_count=m1_n)
+        else:
+            self.sig = M.fetch_bars(self.sym, self.tf, count=sig_n, mt5=mt5,
+                                    date_to=self.end_ts)
+            self.m1 = self._window_m1(m1_n)
+            lo, hi = self.m1.index[0], self.m1.index[-1]
+            self.sig = self.sig[(self.sig.index >= lo) & (self.sig.index <= hi)]
+            if len(self.sig) < 60:
+                raise RuntimeError(
+                    f"Only {len(self.sig)} {self.tf} bars overlap the M1 window "
+                    f"ending {self.end_ts:%Y-%m-%d} — broker history too short")
+            self.cutoff = self.end_ts - pd.Timedelta(days=int(self.days))
         htf_tfs = list(opt.get("htf_tfs", ("H4", "H1")))
         if opt.get("regime_gate"):
             rtf = opt.get("regime_tf", "H1")
@@ -235,19 +284,21 @@ class LiveReplay:
         # HTF candles live gets; otherwise the regime map runs on a short series.
         _, htf_dfs = M.fetch_htf_bars(
             self.sym, days=self.days, mt5=mt5, tfs=tuple(htf_tfs),
-            warmup=LP.HTF_BARS + 60)
+            warmup=LP.HTF_BARS + 60, date_to=self.end_ts)
         self.htf_dfs = htf_dfs
         # MT5 position 0 is the candle still being built. Live only ever acts
         # on index[-2], so replay must not treat that unfinished bar as closed
         # — its high/low keep moving and two runs minutes apart disagree.
-        if len(self.sig) > 1:
+        # A window that ends in the past has no forming bar to drop.
+        if self.end_ts is None and len(self.sig) > 1:
             self.sig = self.sig.iloc[:-1]
         self.ctx = S.M1Ctx(self.m1, self.sig.index)
         self._cache_arrays()
 
         n = int(LP.CALIB_DAYS * 1440 / M.tf_minutes(self.tf)) + 60
         try:
-            dc = M.fetch_bars(self.sym, self.tf, count=n, mt5=mt5)
+            dc = M.fetch_bars(self.sym, self.tf, count=n, mt5=mt5,
+                              date_to=self.end_ts)
             self.st.min_sl = X.calibrate_min_sl(S.Bars(dc), S.Bars(dc).t[0], prof)
         except Exception:
             self.st.min_sl = X.calibrate_min_sl(
@@ -265,6 +316,52 @@ class LiveReplay:
             risk=float(self.st.risk_pct), rules=",".join(self.st.rule_names))
 
         self._install_hooks()
+
+    def _window_m1(self, count):
+        """M1 for a window that may predate what the terminal keeps.
+
+        MT5 holds roughly 100 days of M1, so anything older has to come from the
+        Dukascopy archive. Only the intrabar path is substituted — the signal and
+        HTF frames still come from MT5, so bar boundaries stay broker-aligned
+        exactly as live sees them, which is the alignment that decides regime
+        labels. Dukascopy quotes gold a constant few tenths below this broker;
+        left uncorrected that offset makes long limits easier to touch than short
+        ones, which would bias the very comparison this window is meant to
+        settle, so it is measured on the overlap and removed.
+        """
+        need_from = self.end_ts - pd.Timedelta(minutes=int(count))
+        try:
+            live_m1 = M.fetch_bars(self.sym, "M1", count=99999, mt5=mt5,
+                                   date_to=self.end_ts)
+            if live_m1.index[0] <= need_from:
+                return live_m1
+        except Exception:
+            pass
+
+        recent = None
+        try:
+            recent = M.fetch_bars(self.sym, "M1", count=99999, mt5=mt5)
+        except Exception:
+            pass
+        dk = DK.load_m1(self.asset)
+        shift = 0.0
+        if recent is not None:
+            j = dk[["close"]].join(recent[["close"]], how="inner",
+                                   lsuffix="_dk", rsuffix="_mt").dropna()
+            if len(j) > 1000:
+                shift = float((j["close_mt"] - j["close_dk"]).mean())
+        w = dk[(dk.index >= need_from) & (dk.index <= self.end_ts)]
+        if w.empty:
+            raise RuntimeError(
+                f"No Dukascopy M1 for {self.asset} covering "
+                f"{need_from:%Y-%m-%d}..{self.end_ts:%Y-%m-%d}")
+        w = w.copy()
+        for col in ("open", "high", "low", "close"):
+            w[col] = w[col] + shift
+        print(f"  M1 source: Dukascopy archive  {w.index[0]:%Y-%m-%d} .. "
+              f"{w.index[-1]:%Y-%m-%d}  ({len(w):,} bars, feed offset "
+              f"{shift:+.3f} USD removed).  Signal/HTF still MT5-native.")
+        return w
 
     def _install_hooks(self):
         if self._patched:
@@ -510,6 +607,11 @@ class LiveReplay:
         a = int(self._m1_idx.searchsorted(open_ts, side="left"))
         b = int(self._m1_idx.searchsorted(pd.Timestamp(now), side="left"))
         bar = template.iloc[[0]].copy()
+        # MT5 types volume as uint64. A partial bar's volume is a running sum
+        # that can be fractional once M1 comes from the CSV archive, so widen
+        # the numeric columns before writing into them.
+        num = [c for c in bar.columns if pd.api.types.is_numeric_dtype(bar[c])]
+        bar[num] = bar[num].astype(float)
         bar.index = [open_ts]
         if b <= a:
             px = float(self._sig_close[self._asof_i])
@@ -992,7 +1094,8 @@ class LiveReplay:
 def run_dual(asset: str, days: int, balance: float, mirror_vps: bool = False,
              fill_mode: str = "live", record: bool = False,
              risk_pct: float | None = None, flat_risk: bool = False,
-             fixed_lot: float | None = None, no_cap: bool = False
+             fixed_lot: float | None = None, no_cap: bool = False,
+             end: str | None = None, spread: float | None = None
              ) -> tuple[list[dict], list[LiveReplay], list[dict]]:
     """Run M5 then M15 (shared start balance per bot, like two VPS processes)."""
     engines: list[LiveReplay] = []
@@ -1003,7 +1106,7 @@ def run_dual(asset: str, days: int, balance: float, mirror_vps: bool = False,
             asset, tf, days, balance, fill_mode=fill_mode,
             mirror_vps=mirror_vps, record=record,
             risk_pct=risk_pct, flat_risk=flat_risk, fixed_lot=fixed_lot,
-            no_cap=no_cap)
+            no_cap=no_cap, end=end, spread=spread)
         trades = eng.run(shutdown_mt5=(i == 1))
         engines.append(eng)
         all_trades.extend(trades)
@@ -1070,8 +1173,20 @@ def _compare_backtest(asset, tf, days, balance):
 def main():
     ap = argparse.ArgumentParser(description="Replay live zone engine on history")
     ap.add_argument("--days", type=int, default=14)
+    ap.add_argument(
+        "--end", default=None, metavar="YYYY-MM-DD",
+        help="Replay the --days window ENDING on this date instead of today. "
+             "Signal/HTF bars stay MT5-native; M1 older than the terminal's "
+             "~100-day archive is filled from Dukascopy (offset-corrected)")
     ap.add_argument("--tf", default="M15",
                     help="Signal timeframe: M5/5M or M15/15M (default M15)")
+    ap.add_argument(
+        "--spread", type=float, default=None, metavar="USD",
+        help="Spread to charge every fill. Default takes the live quote only "
+             "when it agrees with the symbol profile, since one quote grabbed "
+             "outside trading hours would otherwise be applied to the whole "
+             "window (WM Markets gold: 0.26 open, 0.68 shut). Measure the real "
+             "distribution with spread_probe.py")
     ap.add_argument("--asset", default="XAUUSD")
     ap.add_argument("--balance", type=float, default=1000.0)
     ap.add_argument(
@@ -1129,7 +1244,7 @@ def main():
             mirror_vps=args.mirror_vps, fill_mode=args.fill,
             record=args.record, risk_pct=args.risk,
             flat_risk=args.flat_risk, fixed_lot=args.flat,
-            no_cap=args.no_cap)
+            no_cap=args.no_cap, end=args.end, spread=args.spread)
         tag = "mirror-vps" if args.mirror_vps else f"fill={args.fill}"
         if args.flat is not None:
             risk_tag = f"FIXED LOT {args.flat:g}"
@@ -1151,7 +1266,8 @@ def main():
             args.asset, args.tf, args.days, args.balance, args.fill,
             mirror_vps=args.mirror_vps, record=args.record,
             risk_pct=args.risk, flat_risk=args.flat_risk,
-            fixed_lot=args.flat, no_cap=args.no_cap)
+            fixed_lot=args.flat, no_cap=args.no_cap, end=args.end,
+            spread=args.spread)
         trades = eng.run()
         tag = "mirror-vps" if args.mirror_vps else f"fill={args.fill}"
         _print_trades(trades, f"LIVE-REPLAY {args.tf} {tag}")

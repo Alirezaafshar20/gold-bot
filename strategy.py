@@ -1014,7 +1014,7 @@ def build_regime_map(htf_context, tf="H1", detector="kaufman", win=40,
 
 def regime_allows(rmap, signal_time, direction, rule=None,
                   shock_gate=False, shock_ratio=1.8,
-                  flip_cooldown_h=0.0):
+                  flip_cooldown_h=0.0, range_macro="both"):
     """Directional gate: block longs in down-regimes and shorts in up-regimes.
     RANGE allows both sides unless MTF macro bias is set (then block counter-bias).
 
@@ -1024,6 +1024,10 @@ def regime_allows(rmap, signal_time, direction, rule=None,
       flip_cooldown_h  block entries for N hours after the macro bias flips
                        (fresh direction is unproven; the first pullback after
                        a V-turn is where the losing clusters happened).
+      range_macro      which side the RANGE macro-bias veto polices — "both"
+                       (default), "long_only", or "off". It is by far the
+                       heaviest filter in the book, so it is worth being able
+                       to measure each side of it independently.
     No map -> always allow (feature off)."""
     if rmap is None:
         return True
@@ -1033,11 +1037,12 @@ def regime_allows(rmap, signal_time, direction, rule=None,
         return False
     if reg == "TREND_DOWN" and d == "long":
         return False
-    if reg == "RANGE" and hasattr(rmap, "macro_at"):
+    if (reg == "RANGE" and range_macro != "off"
+            and hasattr(rmap, "macro_at")):
         macro = rmap.macro_at(signal_time)
         if d == "long" and macro < 0:
             return False
-        if d == "short" and macro > 0:
+        if d == "short" and macro > 0 and range_macro == "both":
             return False
     spike_exempt = rule is not None and rule in SPIKE_RULE_KEYS
     if shock_gate and not spike_exempt and hasattr(rmap, "shock_at"):
@@ -1683,6 +1688,23 @@ def _scan_entry_bar(B, sig_i, wait, direction, proximal, distal, etol, itol,
     return None, None, None
 
 
+def armed_slot_until(B, sig_i, direction, distal, itol_usd, wait):
+    """Last bar index for which an armed-but-unfilled zone still holds its slot.
+
+    Live counts a zone that is merely armed against max_same_dir, and releases
+    it either when a close invalidates the zone or when the wait window runs
+    out. The invalidation test here mirrors the one in `_scan_entry_bar` so the
+    backtest reserves the slot over the same span live does.
+    """
+    end = min(sig_i + wait, B.n - 1)
+    for j in range(sig_i + 1, end + 1):
+        if direction == "long" and B.c[j] < distal - itol_usd:
+            return j
+        if direction == "short" and B.c[j] > distal + itol_usd:
+            return j
+    return end
+
+
 def simulate_trade_m1(B, ctx, direction, sig_i, proximal, distal, wait, max_hold,
                       buffer_atr=None, swing_lb=None, tf_min=15, tag=None,
                       use_structural_tp=False, tp_min_r=0.5, use_trail=True,
@@ -1938,18 +1960,25 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
                  regime_structure_break=False, regime_brk_win=40,
                  regime_shock_gate=False, regime_shock_ratio=1.8,
                  regime_shock_win=24, regime_shock_baseline=720,
-                 regime_flip_cooldown_h=0.0,
+                 regime_flip_cooldown_h=0.0, regime_range_macro="both",
                  meta_gate=None, meta_asset=None, meta_skip_if_no_rules=False,
                  adx_gate=False, adx_min=22.0, adx_require_dir=True,
                  adx_period=14, entry_confirm_mode="none",
                  entry_confirm_rules=None, min_fill_rr=0.0,
-                 max_same_dir=0, limit_at=LIMIT_AT):
+                 max_same_dir=0, limit_at=LIMIT_AT,
+                 arm_blocks_same_dir=False):
     """Run the full rule set on signal_df.
 
     Exits are 1-minute-accurate when `m1` is supplied. When `native_exit=True`
     (or m1 is None), exits resolve on the signal timeframe itself with a
     conservative same-bar (stop-before-target) assumption — used for multi-year
     history where sub-minute data is not available from the broker.
+
+    arm_blocks_same_dir makes max_same_dir count zones that armed but never
+    filled, which is what live does ("at most one open OR armed idea per
+    direction"). Without it this engine only blocks on positions that actually
+    filled, so it evaluates setups live never gets to see — measured at +0.386 R
+    per trade against live_replay's +0.001 R on the same 60-day M15 window.
     """
     if enabled is None:
         enabled = list(DETECTORS.keys())
@@ -1965,6 +1994,8 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
     trades = []
     # open book: (exit_idx, direction) — supports max_same_dir institutional cap
     open_book = []
+    # armed book: (release_idx, direction) for zones that armed and never filled
+    armed_book = []
     trend_tfs = htf_trend_tfs if htf_trend_tfs is not None else htf_tfs
     spike_set = SPIKE_RULE_KEYS if spike_mode else frozenset()
     same_dir_cap = int(max_same_dir or 0)
@@ -1986,6 +2017,8 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
         adx_arr, pdi_arr, mdi_arr = compute_adx_series(B, period=adx_period)
     for i in range(3, B.n - 1):
         open_book = [t for t in open_book if t[0] >= i]
+        if armed_book:
+            armed_book = [t for t in armed_book if t[0] >= i]
         if len(open_book) >= max_concurrent:
             continue
         atr_ok = (not require_atr_regime or atr_regime_pass(
@@ -2020,6 +2053,8 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
             for (direction, proximal, distal, tag) in setups:
                 if same_dir_cap > 0:
                     n_dir = sum(1 for _, d in open_book if d == direction)
+                    if arm_blocks_same_dir:
+                        n_dir += sum(1 for _, d in armed_book if d == direction)
                     if n_dir >= same_dir_cap:
                         continue
                 if not vp_pass(B, i, direction, proximal, vp_mode,
@@ -2046,7 +2081,8 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
                 if not regime_allows(rmap, B.t[i], direction, rule=name,
                                      shock_gate=regime_shock_gate,
                                      shock_ratio=regime_shock_ratio,
-                                     flip_cooldown_h=regime_flip_cooldown_h):
+                                     flip_cooldown_h=regime_flip_cooldown_h,
+                                     range_macro=regime_range_macro):
                     continue
                 if meta_gate is not None and meta_asset is not None:
                     reg = cur_regime if cur_regime is not None else (
@@ -2115,6 +2151,12 @@ def run_backtest(signal_df, m1, enabled=None, wait=WAIT_BARS, max_hold=MAX_HOLD,
                     open_book.append((tr["exit_idx"], direction))
                     hit = True
                     break
+                if arm_blocks_same_dir:
+                    atr_i = B.atr[i] if B.atr[i] > 0 else (B.rng[i] + 1e-6)
+                    armed_book.append((
+                        armed_slot_until(B, i, direction, distal,
+                                         itol * atr_i, wait),
+                        direction))
             if hit:
                 break
     trades.sort(key=lambda t: t["time"])

@@ -64,6 +64,14 @@ REGIME = {
     "regime_shock_win": 24,
     "regime_shock_baseline": 720,
     "regime_flip_cooldown_h": 0.0,    # hours to distrust a fresh macro flip
+    # Inside RANGE the H4 macro bias also vetoes the counter-bias side. That is
+    # the strictest filter in the book: it rejected 177 short candidates in one
+    # 60-day window and 145 in another, while the shorts it let through were the
+    # best cell measured (PF 4.33 and 4.84). Which side it polices:
+    #   both      — veto counter-bias longs AND shorts (historical default)
+    #   long_only — veto counter-bias longs, let shorts through
+    #   off       — RANGE allows both sides regardless of macro bias
+    "regime_range_macro": "both",
 }
 
 # ── Phase 2: meta-gate ───────────────────────────────────────────────────
@@ -140,6 +148,10 @@ ENTRY = {
     "touch_use_limit": True,
     # At most one open OR armed idea per direction (no NDS+VWAP double short).
     "max_same_dir": 1,
+    # Which competing setup claims that single slot when several qualify on the
+    # same bar. "list" = whichever rule comes first in the enabled list (the
+    # historical default, an arbitrary tiebreak); "rr" = best reward-to-risk.
+    "arm_priority": "list",
     # Windsor Brokers Prime (XAU): commission $0, cost is in spread.
     # limit_fill_mode for live_replay broker-sim (and docs for live intent):
     #   strict    — ask must reach the limit price (mid OHLC minus half-spread).

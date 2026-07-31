@@ -175,6 +175,32 @@ def direction_slot_free(st, direction: str) -> bool:
     return (_dir_open_count(st, direction) + _dir_armed_count(st, direction)) < cap
 
 
+def _candidate_rr(z) -> float:
+    """Reward-to-risk of a candidate zone, measured from where the LIMIT rests."""
+    tp, risk = z.get("tp"), z.get("risk") or 0.0
+    if tp is None or risk <= 0:
+        return 0.0
+    rew = (tp - z["limit_px"]) if z["direction"] == "long" else (z["limit_px"] - tp)
+    return float(rew) / float(risk)
+
+
+def rank_candidates(cands, opt):
+    """Order in which competing setups get to claim the same-direction slot.
+
+    With max_same_dir at 1 this order decides most of the book: the winner holds
+    the slot for the whole wait window and every other same-side idea on the bar
+    is dropped.
+
+    list  historical behaviour — whichever rule sits earliest in the enabled
+          list wins. That is an arbitrary tiebreak, not a preference.
+    rr    prefer the setup offering the most reward per unit of risk.
+    """
+    mode = str(opt.get("arm_priority", "list") or "list").lower()
+    if mode == "rr":
+        return sorted(cands, key=_candidate_rr, reverse=True)
+    return cands
+
+
 # Broker/session conditions, not trading rules: these are re-measured on every
 # start (live spread, ATR-calibrated min stop) and would otherwise make the
 # fingerprint drift with the market instead of with the config.
@@ -689,6 +715,7 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
 
     existing = {_zone_fingerprint(z["tag"], z["proximal"], z["direction"], z["signal_bar"])
                 for z in st.pending_zones}
+    candidates = []
     n_cand = n_armed = 0
     wait_min = S.WAIT_BARS * tf_min
     expires = clock_now() + dt.timedelta(minutes=wait_min)
@@ -739,7 +766,8 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
                     rmap, B.t[i], direction, rule=name,
                     shock_gate=opt.get("regime_shock_gate", False),
                     shock_ratio=opt.get("regime_shock_ratio", 1.8),
-                    flip_cooldown_h=opt.get("regime_flip_cooldown_h", 0.0)):
+                    flip_cooldown_h=opt.get("regime_flip_cooldown_h", 0.0),
+                    range_macro=opt.get("regime_range_macro", "both")):
                 _rej(tag, direction, "regime", proximal=float(proximal),
                      regime=cur_regime)
                 continue
@@ -798,12 +826,7 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
             if fp in existing:
                 _rej(trade_tag, direction, "dup", proximal=float(proximal))
                 continue
-            # One idea per direction: skip if already open or armed that way.
-            if not direction_slot_free(st, direction):
-                FR.log_skip_register(
-                    st, rule=trade_tag, side=direction, reason="same_dir",
-                    closed_time=closed_time, proximal=float(proximal), sl=float(sl))
-                continue
+            existing.add(fp)
             zone = {
                 "id": uuid.uuid4().hex[:8],
                 "tag": trade_tag,
@@ -825,16 +848,28 @@ def register_zones(st, df, closed_time, tf_min, account_bal):
                 "touched": False,
                 "limit_ticket": None,
             }
-            st.pending_zones.append(zone)
-            existing.add(fp)
-            n_armed += 1
-            FR.log_armed(st, zone, closed_time, regime=cur_regime)
-            tp_s = f" TP {tp:.2f}" if tp else ""
-            if tp and tp_src:
-                tp_s += f" [{tp_src}]"
-            print(f"[ZONE] {closed_time} {st.key} {trade_tag} {direction.upper()} "
-                  f"entry [{zone_lo:.5g} – {zone_hi:.5g}] limit {limit_px:.5g}  "
-                  f"SL {sl:.5g}{tp_s}  wait={wait_min}m")
+            candidates.append(zone)
+
+    # Competing setups claim the single same-direction slot in this order.
+    for zone in rank_candidates(candidates, opt):
+        direction = zone["direction"]
+        if not direction_slot_free(st, direction):
+            FR.log_skip_register(
+                st, rule=zone["tag"], side=direction, reason="same_dir",
+                closed_time=closed_time, proximal=zone["proximal"],
+                sl=zone["sl"])
+            continue
+        st.pending_zones.append(zone)
+        n_armed += 1
+        FR.log_armed(st, zone, closed_time, regime=cur_regime)
+        tp, tp_src = zone.get("tp"), zone.get("tp_src")
+        tp_s = f" TP {tp:.2f}" if tp else ""
+        if tp and tp_src:
+            tp_s += f" [{tp_src}]"
+        print(f"[ZONE] {closed_time} {st.key} {zone['tag']} "
+              f"{direction.upper()} entry [{zone['zone_lo']:.5g} – "
+              f"{zone['zone_hi']:.5g}] limit {zone['limit_px']:.5g}  "
+              f"SL {zone['sl']:.5g}{tp_s}  wait={wait_min}m")
 
     _bar_log("ok", htf=htf_fp, regime=cur_regime,
              cands=n_cand, armed=n_armed, pending=len(st.pending_zones))

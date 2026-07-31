@@ -88,9 +88,10 @@ def resolve_symbol(preferred=None, mt5=None):
     )
 
 
-def fetch_bars(symbol, tf_str, count=100000, mt5=None):
+def fetch_bars(symbol, tf_str, count=100000, mt5=None, date_to=None):
     """
-    Download the most recent `count` bars from MT5.
+    Download `count` bars from MT5, ending now or at `date_to` (naive UTC).
+
     Returns a DataFrame indexed by time with columns open/high/low/close/volume.
 
     The index is normalised to UTC. MT5 hands back the broker's SERVER wall
@@ -98,6 +99,12 @@ def fetch_bars(symbol, tf_str, count=100000, mt5=None):
     CSVs are true UTC. Leaving that gap open shifted every session-gated rule by
     three hours and moved the day boundary, so "yesterday's high" only matched
     the backtest on half of all bars.
+
+    `date_to` switches from copy_rates_from_pos to copy_rates_from, which walks
+    backwards from a date instead of from bar 0. That matters because
+    copy_rates_from_pos can only ever reach 99999 bars back from *now* — about
+    69 days of M1 — so an older window is unreachable through it even when the
+    terminal holds the history.
     """
     mt5 = mt5 or connect()
     tf_str = tf_str.upper()
@@ -110,10 +117,19 @@ def fetch_bars(symbol, tf_str, count=100000, mt5=None):
     if not mt5.symbol_select(symbol, True):
         raise RuntimeError(f"Could not select symbol '{symbol}' in Market Watch")
 
-    rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, count)
+    if date_to is None:
+        rates = mt5.copy_rates_from_pos(symbol, tf_value, 0, count)
+    else:
+        # copy_rates_from takes the broker's clock, so shift UTC -> server.
+        srv = pd.Timestamp(date_to) + pd.Timedelta(
+            hours=_clock.server_utc_offset(mt5))
+        rates = mt5.copy_rates_from(symbol, tf_value, srv.to_pydatetime(), count)
     if rates is None or len(rates) == 0:
         err = mt5.last_error()
-        raise RuntimeError(f"No {tf_str} data for {symbol}. MT5 error: {err}")
+        raise RuntimeError(
+            f"No {tf_str} data for {symbol}"
+            f"{'' if date_to is None else f' ending {date_to}'}. "
+            f"MT5 error: {err}")
 
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
@@ -167,8 +183,8 @@ def fetch_pair(symbol, signal_tf, m1_count=None, signal_count=None, mt5=None,
         signal_count = signal_count or 100000
         m1_count = m1_count or 100000
 
-    m1 = fetch_bars(sym, "M1", count=m1_count, mt5=mt5)
-    sig = fetch_bars(sym, tf, count=signal_count, mt5=mt5)
+    m1 = fetch_bars(sym, "M1", count=m1_count, mt5=mt5, date_to=date_to)
+    sig = fetch_bars(sym, tf, count=signal_count, mt5=mt5, date_to=date_to)
 
     lo, hi = m1.index[0], m1.index[-1]
     sig = sig[(sig.index >= lo) & (sig.index <= hi)]
@@ -192,7 +208,7 @@ def fetch_pair(symbol, signal_tf, m1_count=None, signal_count=None, mt5=None,
 
 
 def fetch_htf_bars(symbol, days=None, signal_count=None, mt5=None,
-                   tfs=("H4", "H1"), warmup=120):
+                   tfs=("H4", "H1"), warmup=120, date_to=None):
     """Download higher-TF bars aligned with backtest period (for HTF take-profit).
 
     `warmup` must cover whatever HTF window the consumer asks for at runtime.
@@ -210,5 +226,5 @@ def fetch_htf_bars(symbol, days=None, signal_count=None, mt5=None,
             count = _bars_for_period(tf_min, days, warmup=warmup)
         else:
             count = signal_count or 100000
-        out[tf] = fetch_bars(sym, tf, count=count, mt5=mt5)
+        out[tf] = fetch_bars(sym, tf, count=count, mt5=mt5, date_to=date_to)
     return sym, out

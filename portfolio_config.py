@@ -71,13 +71,85 @@ def max_concurrent(asset: str) -> int:
     return MAX_CONCURRENT.get(str(asset).upper(), MAX_CONCURRENT_PER_ASSET)
 
 
+# Sides a rule is allowed to trade, when it should not trade both. Empty means
+# every enabled rule may trade both ways, which is the historical behaviour.
+#
+# Format: {ASSET: {RULE: ("short",) | ("long",) | ("long", "short")}}
+#
+# Pooling a falling 60-day window with a rising one separates rules that lose
+# because the market went against them from rules that lose regardless. On gold
+# that split is stark — ADX long returns PF 1.26 over 59 trades, while these
+# four give back 20.1R between them and still earn their keep short:
+#
+#   "XAUUSD": {"NDS": ("short",), "FL": ("short",),
+#              "NDS_BOS": ("short",), "NDS_FVG": ("short",)}
+#
+# Measure with rule_sides_test.py before pasting that in; it changes live.
+RULE_SIDES: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+# Sides allowed inside each regime label. Empty means every label trades both
+# ways, which is the historical behaviour.
+#
+# Format: {ASSET: {REGIME: ("short",) | ("long",) | ("long", "short")}}
+#
+# This is a different question from RULE_SIDES above, and regime_audit.py is what
+# answers it. That tool measures each label as a pure directional bias — mean
+# favourable excursion over mean adverse excursion, in ATR units, on every H1 bar
+# of the archive — with no rules involved. On four years of gold the RANGE label
+# scores 1.056 for longs against 1.064 for an unfiltered long, i.e. it adds
+# nothing directional, while TREND_UP adds +0.069 and TREND_DOWN +0.066.
+#
+# The book nonetheless takes 70% of its longs inside RANGE, and that is where
+# 11.2R of its 13.3R long loss is booked. Shorts in RANGE are the opposite: they
+# are the strongest cell measured, because a supply-zone short in a range is a
+# mean-reversion trade that does not need the label to be directional.
+#
+#   "XAUUSD": {"RANGE": ("short",)}
+#
+# Measure with regime_sides_test.py before pasting that in; it changes live.
+REGIME_SIDES: dict[str, dict[str, tuple[str, ...]]] = {}
+
+
+def regime_sides(asset: str, regime: str) -> tuple[str, ...] | None:
+    """Allowed sides inside a regime label, or None when both are permitted."""
+    table = REGIME_SIDES.get(str(asset).upper())
+    if not table:
+        return None
+    return table.get(str(regime).upper())
+
+
+def rule_sides(asset: str, rule: str) -> tuple[str, ...] | None:
+    """Allowed sides for a rule, or None when both sides are permitted.
+
+    Rule tags reach here in several spellings (NDS-FVG, NDS_FVG, nds_fvg), so
+    the lookup normalises separators rather than trusting the caller.
+    """
+    table = RULE_SIDES.get(str(asset).upper())
+    if not table:
+        return None
+    key = str(rule).upper().replace("-", "_")
+    return table.get(key)
+
+
 def rule_allowed(asset: str, rule: str, regime: str,
                  direction: str | None = None, macro: int = 0) -> bool:
-    """Regime + MTF macro bias filter (CH-REV long only in bull context)."""
+    """Regime + MTF macro bias filter, plus side restrictions.
+
+    Two independent side filters apply, and a direction has to satisfy both:
+    RULE_SIDES asks whether this rule may trade that way at all, REGIME_SIDES
+    asks whether anything may trade that way in this market state.
+    """
     asset = str(asset).upper()
     rule = str(rule).upper()
     regime = str(regime).upper()
     d = str(direction or "").lower()
+    sides = rule_sides(asset, rule)
+    if sides is not None and d and d not in sides:
+        return False
+    rsides = regime_sides(asset, regime)
+    if rsides is not None and d and d not in rsides:
+        return False
     if asset == "XAUUSD" and rule == "CH_REV_L":
         if regime == "TREND_UP":
             return True
